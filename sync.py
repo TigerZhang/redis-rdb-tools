@@ -7,16 +7,16 @@ from rdbtools import RdbParser, RdbCallback
 import redis
 import getopt
 
-SRC_REDIS_IP = '127.0.0.1'
-SRC_REDIS_PORT = 6379
-TGT_REDIS_IP = '127.0.0.1'
-TGT_REDIS_PORT = 7000
+# SRC_REDIS_IP = '127.0.0.1'
+# SRC_REDIS_PORT = 6379
+# TGT_REDIS_IP = '127.0.0.1'
+# TGT_REDIS_PORT = 7000
 BUFFER_SIZE = 1024
-RDB_FILENAME = "sync-py.rdb"
-appkeys = ['564c13b8f085fc471efdfff8']
+# RDB_FILENAME = "sync-py.rdb"
+# appkeys = ['564c13b8f085fc471efdfff8']
 
-def connect_target():
-    return redis.StrictRedis(host=TGT_REDIS_IP, port=TGT_REDIS_PORT, db=0)
+def connect_target(target_redis_ip, target_redis_port):
+    return redis.StrictRedis(host=target_redis_ip, port=target_redis_port, db=0)
 
 def get_size(s):
     c = s.recv(1)
@@ -28,14 +28,14 @@ def get_size(s):
         size += c
     return size
 
-def read_bulk(s):
+def read_bulk(s, rdb_filename):
     s.send("SYNC\r\n")
     c = s.recv(1)
     if c.startswith('$'):
         len = int(get_size(s))
         if len > BUFFER_SIZE:
             print "large bulk with size " + str(len) + " should write to file"
-        f = open(RDB_FILENAME, 'wb')
+        f = open(rdb_filename, 'wb')
         while True:
             curlen = min(BUFFER_SIZE, len)
             buf = s.recv(curlen)
@@ -45,7 +45,7 @@ def read_bulk(s):
                 break
             len -= curlen
 
-def read_update(s, target):
+def read_update(s, target, appkeys):
     star = s.recv(1)
     if star.startswith('*'):
         star_len = int(get_size(s))
@@ -58,44 +58,49 @@ def read_update(s, target):
                 command.append(s.recv(len))
                 star_len -= 1
             
-        handle_command(s, target, command)
+        handle_command(s, target, command, appkeys)
 
-def set_op_wrapper(target, cmd, key, member):
+def set_op_wrapper(target, cmd, key, member, appkeys):
     for i, appkey in enumerate(appkeys):
         if appkey in key:
             print "apply:", cmd, key, member
             getattr(target, cmd)(key, member)
         else:
-            print "ignore:", cmd, key, member
+            i = i
+            # print "ignore:", cmd, key, member
 
-def load_rdb(target):
+def load_rdb(target, rdb_filename, appkeys):
     class MyCallback(RdbCallback) :
         ''' Simple example to show how callback works. 
             See RdbCallback for all available callback methods.
             See JsonCallback for a concrete example
         ''' 
         def set(self, key, value, expiry):
-            print('%s = %s' % (str(key), str(value)))
+            key = key
+            # print('%s = %s' % (str(key), str(value)))
 
         def hset(self, key, field, value):
-            print('%s.%s = %s' % (str(key), str(field), str(value)))
+            key = key
+            # print('%s.%s = %s' % (str(key), str(field), str(value)))
 
         def sadd(self, key, member):
             # print('%s has {%s}' % (str(key), str(member)))
             # target.sadd(key, member)
-            set_op_wrapper(target, "sadd", key, member)
+            set_op_wrapper(target, "sadd", key, member, appkeys)
 
         def rpush(self, key, value) :
-            print('%s has [%s]' % (str(key), str(value)))
+            key = key
+            # print('%s has [%s]' % (str(key), str(value)))
 
         def zadd(self, key, score, member):
-            print('%s has {%s : %s}' % (str(key), str(member), str(score)))
+            key = key
+            # print('%s has {%s : %s}' % (str(key), str(member), str(score)))
 
     callback = MyCallback()
     parser = RdbParser(callback)
-    parser.parse(RDB_FILENAME)
+    parser.parse(rdb_filename)
 
-def handle_command(s, target, command):
+def handle_command(s, target, command, appkeys):
     if command[0] == "PING":
         s.send("+PONG\r\n")
     else:
@@ -103,13 +108,13 @@ def handle_command(s, target, command):
         print "cmd:", cmd
         if cmd == "sadd" or cmd == "srem":
             # getattr(target, cmd)(command[1], command[2])
-            set_op_wrapper(target, cmd, command[1], command[2])
+            set_op_wrapper(target, cmd, command[1], command[2], appkeys)
         else:
             print "ignore command:", command
 
-def connect_upstream():
+def connect_upstream(src_redis_ip, src_redis_port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((SRC_REDIS_IP, SRC_REDIS_PORT))
+    s.connect((src_redis_ip, src_redis_port))
     s.send("PING\r\n")
     pong = s.recv(BUFFER_SIZE)
     if not pong.startswith("+PONG"):
@@ -143,6 +148,11 @@ def main():
         sys.exit(2)
     output = None
     verbose = False
+    rdb_filename = 'sync-py.rdb'
+    appkeys = ['564c13b8f085fc471efdfff8']
+
+    src_redis_ip = src_redis_port = target_redis_port = target_redis_ip = None
+
     for o, a in opts:
         print o, a
         if o == "-v":
@@ -153,29 +163,33 @@ def main():
         elif o in ("-o", "--output"):
             output = a
         elif o in ("-s", "--sourceserver"):
-            SRC_REDIS_IP = a
+            src_redis_ip = a
         elif o in ("-p", "--sourceport"):
-            SRC_REDIS_PORT = a
+            src_redis_port = int(a)
         elif o in ("-t", "--targetserver"):
-            TGT_REDIS_IP = a
+            target_redis_ip = a
         elif o in ("-P", "--targetport"):
-            TGT_REDIS_PORT = a
+            target_redis_port = int(a)
         elif o in ("-r", "--redbfilename"):
-            RDB_FILENAME = a
+            rdb_filename = a
         elif o in ("-a", "--appkeys"):
             appkeys = a.split('/')
         else:
             assert False, "unhandled option"
             # ...
 
-    s = connect_upstream()
-    target = connect_target()
+    if src_redis_ip is None or src_redis_port is None or target_redis_ip is None or target_redis_port is None:
+        usage()
+        sys.exit(3)
 
-    read_bulk(s)
-    load_rdb(target)
+    s = connect_upstream(src_redis_ip, src_redis_port)
+    target = connect_target(target_redis_ip, target_redis_port)
+
+    read_bulk(s, rdb_filename)
+    load_rdb(target, rdb_filename, appkeys)
 
     while True:
-        read_update(s, target)
+        read_update(s, target, appkeys)
 
     s.close()
 
